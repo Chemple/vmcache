@@ -182,6 +182,7 @@ struct ResidentPageSet {
       u64 pos = hash(pid) & mask;
       while (true) {
          u64 curr = ht[pos].pid.load();
+         // Learn(shiwen): unique key.actually yes.
          assert(curr != pid);
          if ((curr == empty) || (curr == tombstone))
             if (ht[pos].pid.compare_exchange_strong(curr, pid))
