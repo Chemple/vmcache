@@ -6,9 +6,6 @@
 #include <fcntl.h>
 #include <functional>
 #include <iostream>
-#include <mutex>
-#include <numeric>
-#include <set>
 #include <thread>
 #include <vector>
 #include <span>
@@ -24,7 +21,7 @@
 #include <immintrin.h>
 
 #include "exmap.h"
-
+// __thread variable. every thread has its own variable. 
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
@@ -39,6 +36,7 @@ typedef u64 PID; // page id type
 
 static const u64 pageSize = 4096;
 
+// only contains one control flag. dirty flag.
 struct alignas(4096) Page {
    bool dirty;
 };
@@ -116,6 +114,10 @@ struct PageState {
    }
 
    void unlockS() {
+      // can not write code below👇, because maybe oldStateAndVersion will change before store operation.
+      // u64 oldStateAndVersion = stateAndVersion.load();
+      // u64 state = getState(oldStateAndVersion);
+      // stateAndVersion.store(sameVersion(oldStateAndVersion, state-1),std::memory_order_release);
       while (true) {
          u64 oldStateAndVersion = stateAndVersion.load();
          u64 state = getState(oldStateAndVersion);
@@ -260,6 +262,7 @@ struct LibaioInterface {
       }
       int cnt = io_submit(ctx, pages.size(), cbPtr);
       assert(cnt == pages.size());
+      // block until all the write event flushes to the disk.
       cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
       assert(cnt == pages.size());
    }
@@ -279,6 +282,8 @@ struct BufferManager {
    int blockfd;
    int exmapfd;
 
+   
+   // multi-thread supports
    atomic<u64> physUsedCount;
    ResidentPageSet residentSet;
    atomic<u64> allocCount;
@@ -318,6 +323,7 @@ BufferManager bm;
 
 struct OLCRestartException {};
 
+// optimistic lock?
 template<class T>
 struct GuardO {
    PID pid;
@@ -654,6 +660,7 @@ Page* BufferManager::allocPage() {
       cerr << "VIRTGB is too low" << endl;
       exit(EXIT_FAILURE);
    }
+   // because the page of pid is first touch after init. so its state must be Evicted.
    u64 stateAndVersion = getPageState(pid).stateAndVersion;
    bool succ = getPageState(pid).tryLockX(stateAndVersion);
    assert(succ);
@@ -667,8 +674,9 @@ Page* BufferManager::allocPage() {
          ensureFreePages();
       }
    }
+   // NOTE(shiwen): the code below will allocate one physical page.(map one physical page to the virtual page?)
    virtMem[pid].dirty = true;
-
+   // why not fix the page?
    return virtMem + pid;
 }
 
@@ -1373,7 +1381,7 @@ struct BTree {
                return false;
 
             {
-               GuardX<BTreeNode> nodeLocked(move(node));
+               GuardX<BTreeNode> nodeLocked(std::move(node));
                fn(nodeLocked->getPayload(pos));
                return true;
             }
@@ -1391,7 +1399,7 @@ struct BTree {
             while (node->isInner())
                node = GuardO<BTreeNode>(node->lookupInner(key), node);
 
-            return GuardS<BTreeNode>(move(node));
+            return GuardS<BTreeNode>(std::move(node));
          } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
    }
@@ -1458,7 +1466,7 @@ void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<
       AllocGuard<BTreeNode> newRoot(false);
       newRoot->upperInnerNode = node.pid;
       metaData->roots[slotId] = newRoot.pid;
-      parent = move(newRoot);
+      parent = std::move(newRoot);
    }
 
    // split
@@ -1485,15 +1493,15 @@ void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen)
          GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent);
 
          while (node->isInner() && (node.ptr != toSplit)) {
-            parent = move(node);
+            parent = std::move(node);
             node = GuardO<BTreeNode>(parent->lookupInner(key), parent);
          }
          if (node.ptr == toSplit) {
             if (node->hasSpaceFor(key.size(), payloadLen))
                return; // someone else did split concurrently
-            GuardX<BTreeNode> parentLocked(move(parent));
-            GuardX<BTreeNode> nodeLocked(move(node));
-            trySplit(move(nodeLocked), move(parentLocked), key, payloadLen);
+            GuardX<BTreeNode> parentLocked(std::move(parent));
+            GuardX<BTreeNode> nodeLocked(std::move(node));
+            trySplit(std::move(nodeLocked), std::move(parentLocked), key, payloadLen);
          }
          return;
       } catch(const OLCRestartException&) { yield(repeatCounter); }
@@ -1510,22 +1518,22 @@ void BTree::insert(span<u8> key, span<u8> payload)
          GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent);
 
          while (node->isInner()) {
-            parent = move(node);
+            parent = std::move(node);
             node = GuardO<BTreeNode>(parent->lookupInner(key), parent);
          }
 
          if (node->hasSpaceFor(key.size(), payload.size())) {
             // only lock leaf
-            GuardX<BTreeNode> nodeLocked(move(node));
+            GuardX<BTreeNode> nodeLocked(std::move(node));
             parent.release();
             nodeLocked->insertInPage(key, payload);
             return; // success
          }
 
          // lock parent and leaf
-         GuardX<BTreeNode> parentLocked(move(parent));
-         GuardX<BTreeNode> nodeLocked(move(node));
-         trySplit(move(nodeLocked), move(parentLocked), key, payload.size());
+         GuardX<BTreeNode> parentLocked(std::move(parent));
+         GuardX<BTreeNode> nodeLocked(std::move(node));
+         trySplit(std::move(nodeLocked), std::move(parentLocked), key, payload.size());
          // insert hasn't happened, restart from root
       } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
@@ -1542,7 +1550,7 @@ bool BTree::remove(span<u8> key)
          while (node->isInner()) {
             pos = node->lowerBound(key);
             PID nextPage = (pos == node->count) ? node->upperInnerNode : node->getChild(pos);
-            parent = move(node);
+            parent = std::move(node);
             node = GuardO<BTreeNode>(nextPage, parent);
          }
 
@@ -1554,8 +1562,8 @@ bool BTree::remove(span<u8> key)
          unsigned sizeEntry = node->slot[slotId].keyLen + node->slot[slotId].payloadLen;
          if ((node->freeSpaceAfterCompaction()+sizeEntry >= BTreeNodeHeader::underFullSize) && (parent.pid != metadataPageId) && (parent->count >= 2) && ((pos + 1) < parent->count)) {
             // underfull
-            GuardX<BTreeNode> parentLocked(move(parent));
-            GuardX<BTreeNode> nodeLocked(move(node));
+            GuardX<BTreeNode> parentLocked(std::move(parent));
+            GuardX<BTreeNode> nodeLocked(std::move(node));
             GuardX<BTreeNode> rightLocked(parentLocked->getChild(pos + 1));
             nodeLocked->removeSlot(slotId);
             if (rightLocked->freeSpaceAfterCompaction() >= (pageSize-BTreeNodeHeader::underFullSize)) {
@@ -1564,7 +1572,7 @@ bool BTree::remove(span<u8> key)
                }
             }
          } else {
-            GuardX<BTreeNode> nodeLocked(move(node));
+            GuardX<BTreeNode> nodeLocked(std::move(node));
             parent.release();
             nodeLocked->removeSlot(slotId);
          }
