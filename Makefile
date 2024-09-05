@@ -3,4 +3,3 @@ vmcache: vmcache.cpp tpcc/*pp
 
 clean:
 	rm vmcache
-	

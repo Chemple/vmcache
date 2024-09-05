@@ -1,5 +1,4 @@
 #pragma once
-#include "Types.hpp"
 #include <atomic>
 
 class MersenneTwister

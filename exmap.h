@@ -1,7 +1,5 @@
 #pragma once
 #include <asm/ioctl.h>
-#include <bits/types/struct_iovec.h>
-#include <cstdint>
 #include <linux/types.h>
 
 #define STATIC_ASSERT(COND,MSG) typedef char static_assertion_##MSG[(!!(COND))*2-1]
@@ -18,7 +16,7 @@ struct exmap_action_params {
 struct exmap_ioctl_setup {
 	int    fd;
 	int    max_interfaces;
-	std::size_t buffer_size;
+	size_t buffer_size;
 	uint64_t flags;
 };
 
